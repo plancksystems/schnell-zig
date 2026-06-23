@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -39,6 +38,9 @@ pub const Server = struct {
     static_dir: ?[]const u8,
     static_store: ?*StaticContentStore = null,
     tls_auth: ?*tls.config.CertKeyPair,
+    tls_auth_owned: bool,
+    tls_cert_file: []const u8,
+    tls_key_file: []const u8,
     raw_handler: ?RawHandlerFn,
     raw_ctx: ?*anyopaque,
     on_request_complete: ?*const fn (method: []const u8, status: u16, elapsed_us: u64, ctx: ?*anyopaque) void,
@@ -55,6 +57,10 @@ pub const Server = struct {
         max_requests_per_connection: u32 = 10_000,
         static_dir: ?[]const u8 = null,
         drain_timeout_ms: u32 = 5_000,
+        // TLS is presence-based: enabled when both cert and key paths are set.
+        // (Avoids a bool field, which YAML config loaders can't default when absent.)
+        tls_cert_file: []const u8 = "",
+        tls_key_file: []const u8 = "",
     };
 
     pub fn init(allocator: Allocator, config: Config) !Server {
@@ -81,6 +87,9 @@ pub const Server = struct {
             .listener = null,
             .static_dir = config.static_dir,
             .tls_auth = null,
+            .tls_auth_owned = false,
+            .tls_cert_file = config.tls_cert_file,
+            .tls_key_file = config.tls_key_file,
             .raw_handler = null,
             .raw_ctx = null,
             .on_request_complete = null,
@@ -98,16 +107,28 @@ pub const Server = struct {
         self.raw_ctx = ctx;
     }
 
-    pub fn setRequestMetricsCallback(
-        self: *Server,
-        callback: *const fn ([]const u8, u16, u64, ?*anyopaque) void,
-        ctx: ?*anyopaque
-    ) void {
+    pub fn setRequestMetricsCallback(self: *Server, callback: *const fn ([]const u8, u16, u64, ?*anyopaque) void, ctx: ?*anyopaque) void {
         self.on_request_complete = callback;
         self.metrics_ctx = ctx;
     }
 
     pub fn listen(self: *Server, thr_io: Io) !void {
+        if (self.tls_auth == null and self.tls_cert_file.len > 0 and self.tls_key_file.len > 0) {
+            const auth = try self.allocator.create(tls.config.CertKeyPair);
+            auth.* = tls.config.CertKeyPair.fromFilePathAbsolute(
+                self.allocator,
+                thr_io,
+                self.tls_cert_file,
+                self.tls_key_file,
+            ) catch |err| {
+                log.err("Failed to load TLS certificate/key ({s}, {s}): {}", .{ self.tls_cert_file, self.tls_key_file, err });
+                self.allocator.destroy(auth);
+                return err;
+            };
+            self.tls_auth = auth;
+            self.tls_auth_owned = true;
+        }
+
         if (self.static_dir) |dir| {
             const store = try self.allocator.create(StaticContentStore);
             store.* = try StaticContentStore.init(self.allocator, dir);
@@ -307,11 +328,11 @@ pub const Server = struct {
                 return;
             };
 
-            const body_len = req.contentLength() catch |err| {
-                log.warn("runRequestLoop: contentLength parse failed for {s} {s}: {}", .{ req.method.toString(), req.path, err });
-                sendError(thr_io, connection, .bad_request, "Malformed Content-Length");
+            const body_len = validateFraming(header_buf[0..header_end.?]) catch |err| {
+                log.warn("runRequestLoop: rejected request framing for {s} {s}: {}", .{ req.method.toString(), req.path, err });
+                sendError(thr_io, connection, .bad_request, "Bad Request");
                 return;
-            } orelse 0;
+            };
 
             log.debug("runRequestLoop: {s} {s} req#{d} body_len={d} keep_alive={}", .{
                 req.method.toString(), req.path, request_count, body_len, req.keep_alive,
@@ -379,9 +400,9 @@ pub const Server = struct {
                     log.warn(
                         "response writeAll failed for {s} {s}: {} (status={d}, body_len={d}, bytes_len={d})",
                         .{
-                            req.method.toString(),  req.path,
-                            err,
-                            @intFromEnum(res.status), res.body.items.len, response_bytes.len,
+                            req.method.toString(), req.path,
+                            err,                   @intFromEnum(res.status),
+                            res.body.items.len,    response_bytes.len,
                         },
                     );
                     return;
@@ -391,8 +412,8 @@ pub const Server = struct {
                     "res.toBytes failed for {s} {s}: {} (write_buf={d}, body_len={d}); falling back to streamResponse",
                     .{
                         req.method.toString(), req.path,
-                        err,
-                        write_buf.len, res.body.items.len,
+                        err,                   write_buf.len,
+                        res.body.items.len,
                     },
                 );
                 streamResponse(writer, &res) catch |se| {
@@ -400,8 +421,8 @@ pub const Server = struct {
                         "streamResponse failed for {s} {s}: {} (status={d}, body_len={d})",
                         .{
                             req.method.toString(), req.path,
-                            se,
-                            @intFromEnum(res.status), res.body.items.len,
+                            se,                    @intFromEnum(res.status),
+                            res.body.items.len,
                         },
                     );
                     return;
@@ -413,8 +434,8 @@ pub const Server = struct {
                     "writer.flush failed for {s} {s}: {} (status={d}, body_len={d})",
                     .{
                         req.method.toString(), req.path,
-                        err,
-                        @intFromEnum(res.status), res.body.items.len,
+                        err,                   @intFromEnum(res.status),
+                        res.body.items.len,
                     },
                 );
                 return;
@@ -470,7 +491,11 @@ pub const Server = struct {
                 }
             }
 
-            const body_len = scanContentLength(header_buf[0..header_end.?]);
+            const body_len = validateFraming(header_buf[0..header_end.?]) catch {
+                writer.writeAll("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+                writer.flush() catch {};
+                return;
+            };
             if (body_len > self.max_body_size) return;
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -548,19 +573,43 @@ pub const Server = struct {
         }
     }
 
-    fn scanContentLength(headers: []const u8) usize {
-        const patterns = [_][]const u8{ "Content-Length: ", "content-length: " };
-        for (patterns) |pattern| {
-            if (mem.indexOf(u8, headers, pattern)) |pos| {
-                const start = pos + pattern.len;
-                var end = start;
-                while (end < headers.len and headers[end] >= '0' and headers[end] <= '9') : (end += 1) {}
-                if (end > start) {
-                    return std.fmt.parseInt(usize, headers[start..end], 10) catch 0;
-                }
+    // Request-smuggling defenses (H12): the server reads the body strictly by
+    // Content-Length, so any length ambiguity is rejected. Returns the single
+    // declared body length (0 if none). Parsing line-by-line also fixes the old
+    // substring scan that matched "Content-Length:" inside other header names.
+    const FramingError = error{
+        BadHeader,
+        TransferEncodingUnsupported,
+        DuplicateContentLength,
+        BadContentLength,
+    };
+
+    fn validateFraming(headers: []const u8) FramingError!usize {
+        var lines = mem.splitSequence(u8, headers, "\r\n");
+        _ = lines.next(); // request line
+        var cl_seen = false;
+        var cl_value: usize = 0;
+        while (lines.next()) |line| {
+            if (line.len == 0) break; // end of header block
+            // obsolete line folding (leading SP/HTAB) is a smuggling vector
+            if (line[0] == ' ' or line[0] == '\t') return error.BadHeader;
+            const colon = mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
+            const name = line[0..colon];
+            if (name.len == 0) return error.BadHeader;
+            // whitespace before the colon is disallowed (RFC 7230 §3.2.4)
+            const last = name[name.len - 1];
+            if (last == ' ' or last == '\t') return error.BadHeader;
+            const value = mem.trim(u8, line[colon + 1 ..], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                return error.TransferEncodingUnsupported;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                if (cl_seen) return error.DuplicateContentLength;
+                cl_seen = true;
+                cl_value = std.fmt.parseInt(usize, value, 10) catch return error.BadContentLength;
             }
         }
-        return 0;
+        return cl_value;
     }
 
     fn scanPath(headers: []const u8) ?[]const u8 {
@@ -652,5 +701,58 @@ pub const Server = struct {
             store.deinit();
             self.allocator.destroy(store);
         }
+        if (self.tls_auth_owned) {
+            if (self.tls_auth) |auth| {
+                auth.deinit(self.allocator);
+                self.allocator.destroy(auth);
+            }
+        }
     }
 };
+
+const testing = std.testing;
+
+test "validateFraming - clean request returns content length" {
+    const h = "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 42\r\n\r\n";
+    try testing.expectEqual(@as(usize, 42), try Server.validateFraming(h));
+}
+
+test "validateFraming - no body returns zero" {
+    const h = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    try testing.expectEqual(@as(usize, 0), try Server.validateFraming(h));
+}
+
+test "validateFraming - duplicate Content-Length rejected" {
+    const h = "POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
+    try testing.expectError(error.DuplicateContentLength, Server.validateFraming(h));
+}
+
+test "validateFraming - Transfer-Encoding rejected" {
+    const h = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try testing.expectError(error.TransferEncodingUnsupported, Server.validateFraming(h));
+}
+
+test "validateFraming - Content-Length plus Transfer-Encoding rejected" {
+    const h = "POST /x HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try testing.expectError(error.TransferEncodingUnsupported, Server.validateFraming(h));
+}
+
+test "validateFraming - whitespace before colon rejected" {
+    const h = "POST /x HTTP/1.1\r\nContent-Length : 5\r\n\r\n";
+    try testing.expectError(error.BadHeader, Server.validateFraming(h));
+}
+
+test "validateFraming - obsolete line folding rejected" {
+    const h = "POST /x HTTP/1.1\r\nX-Test: a\r\n folded\r\n\r\n";
+    try testing.expectError(error.BadHeader, Server.validateFraming(h));
+}
+
+test "validateFraming - non-numeric Content-Length rejected" {
+    const h = "POST /x HTTP/1.1\r\nContent-Length: abc\r\n\r\n";
+    try testing.expectError(error.BadContentLength, Server.validateFraming(h));
+}
+
+test "validateFraming - similarly-named header is not mistaken for Content-Length" {
+    const h = "GET / HTTP/1.1\r\nX-My-Content-Length: 999\r\n\r\n";
+    try testing.expectEqual(@as(usize, 0), try Server.validateFraming(h));
+}
