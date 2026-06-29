@@ -1,7 +1,7 @@
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bson = @import("bson");
+const sys = @import("sys.zig");
 
 pub const TokenStore = struct {
     const Self = @This();
@@ -78,7 +78,7 @@ pub const TokenStore = struct {
     pub fn validate(self: *Self, bearer_token: []const u8, client_ip: ?[]const u8, bind_ip: bool) ?TokenEntry {
         const entry = self.tokens.get(bearer_token) orelse return null;
 
-        const now = std.time.milliTimestamp();
+        const now = sys.nowUnixMilliSeconds();
         if (now > entry.expires_at) {
             self.removeToken(bearer_token);
             return null;
@@ -97,7 +97,7 @@ pub const TokenStore = struct {
     }
 
     pub fn purgeExpired(self: *Self) void {
-        const now = std.time.milliTimestamp();
+        const now = sys.nowUnixMilliSeconds();
         var to_remove: std.ArrayList([]const u8) = .{};
         defer to_remove.deinit(self.allocator);
 
@@ -117,7 +117,6 @@ pub const TokenStore = struct {
         return @intCast(self.tokens.count());
     }
 
-    
     fn evictLru(self: *Self) void {
         if (self.access_order.items.len == 0) return;
         const lru_key = self.access_order.orderedRemove(0);
@@ -165,7 +164,6 @@ const TokenBson = struct {
     client_ip: []const u8 = "",
 };
 
-
 const testing = std.testing;
 
 test "TokenStore - init and deinit" {
@@ -182,7 +180,7 @@ test "TokenStore - insert and validate via internal API" {
     const entry = TokenStore.TokenEntry{
         .uid = try testing.allocator.dupe(u8, "user1"),
         .role = try testing.allocator.dupe(u8, "admin"),
-        .expires_at = std.time.milliTimestamp() + 60_000,
+        .expires_at = sys.nowUnixMilliSeconds() + 60_000,
         .client_ip = null,
     };
     try store.tokens.put(testing.allocator, token_key, entry);
@@ -204,7 +202,7 @@ test "TokenStore - validate rejects expired token" {
     const entry = TokenStore.TokenEntry{
         .uid = try testing.allocator.dupe(u8, "user1"),
         .role = try testing.allocator.dupe(u8, "read_only"),
-        .expires_at = std.time.milliTimestamp() - 1000,
+        .expires_at = sys.nowUnixMilliSeconds() - 1000,
         .client_ip = null,
     };
     try store.tokens.put(testing.allocator, token_key, entry);
@@ -231,7 +229,7 @@ test "TokenStore - LRU eviction at capacity" {
     try store.tokens.put(testing.allocator, k1, .{
         .uid = try testing.allocator.dupe(u8, "u1"),
         .role = try testing.allocator.dupe(u8, "admin"),
-        .expires_at = std.time.milliTimestamp() + 60_000,
+        .expires_at = sys.nowUnixMilliSeconds() + 60_000,
         .client_ip = null,
     });
     try store.access_order.append(testing.allocator, k1);
@@ -240,7 +238,7 @@ test "TokenStore - LRU eviction at capacity" {
     try store.tokens.put(testing.allocator, k2, .{
         .uid = try testing.allocator.dupe(u8, "u2"),
         .role = try testing.allocator.dupe(u8, "read_write"),
-        .expires_at = std.time.milliTimestamp() + 60_000,
+        .expires_at = sys.nowUnixMilliSeconds() + 60_000,
         .client_ip = null,
     });
     try store.access_order.append(testing.allocator, k2);
@@ -262,7 +260,7 @@ test "TokenStore - purgeExpired removes only expired tokens" {
     try store.tokens.put(testing.allocator, k1, .{
         .uid = try testing.allocator.dupe(u8, "u1"),
         .role = try testing.allocator.dupe(u8, "admin"),
-        .expires_at = std.time.milliTimestamp() + 60_000,
+        .expires_at = sys.nowUnixMilliSeconds() + 60_000,
         .client_ip = null,
     });
     try store.access_order.append(testing.allocator, k1);
@@ -271,7 +269,7 @@ test "TokenStore - purgeExpired removes only expired tokens" {
     try store.tokens.put(testing.allocator, k2, .{
         .uid = try testing.allocator.dupe(u8, "u2"),
         .role = try testing.allocator.dupe(u8, "read_only"),
-        .expires_at = std.time.milliTimestamp() - 1000,
+        .expires_at = sys.nowUnixMilliSeconds() - 1000,
         .client_ip = null,
     });
     try store.access_order.append(testing.allocator, k2);

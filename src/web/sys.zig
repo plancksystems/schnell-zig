@@ -17,6 +17,15 @@ pub fn nowUnixSeconds() i64 {
     }
 }
 
+pub fn nowUnixMilliSeconds() i64 {
+    if (comptime is_wasm) {
+        return host_now_unix_s();
+    } else {
+        const io = schnell.currentIo() orelse @panic("web.sys.nowUnixSeconds: no current Io — call from inside an Io context");
+        return std.Io.Clock.now(.real, io).toMilliseconds();
+    }
+}
+
 pub fn randomBytes(buf: []u8) void {
     if (comptime is_wasm) {
         host_random_bytes(buf.ptr, @intCast(buf.len));

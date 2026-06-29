@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -15,6 +14,7 @@ const Middleware = middleware_mod.Middleware;
 const MatchedRoute = middleware_mod.MatchedRoute;
 const client_mod = @import("client.zig");
 const Client = client_mod.Client;
+const Providers = @import("providers/root.zig").Providers;
 
 pub threadlocal var current_io: ?Io = null;
 
@@ -29,7 +29,7 @@ pub const StreamingHandlerFn = *const fn (
     ctx: ?*anyopaque,
     allocator: Allocator,
     req: *const Request,
-    writer: *std.Io.Writer,
+    req_writer: *std.Io.Writer,
 ) anyerror!void;
 
 const RouteEntry = struct {
@@ -46,64 +46,34 @@ const StreamingRouteEntry = struct {
     ctx: ?*anyopaque,
 };
 
-pub const ProxyFieldMapping = struct {
-    local_key: []const u8,
-    upstream_name: []const u8,
-};
-
-pub const ProxyOptions = struct {
-    target_path: ?[]const u8 = null,
-
-    strip_prefix: bool = false,
-
-    forward_locals_as_query: []const ProxyFieldMapping = &.{},
-
-    forward_locals_as_form_body: []const ProxyFieldMapping = &.{},
-
-    forward_locals_as_header: []const ProxyFieldMapping = &.{},
-};
-
-const ProxyConfig = struct {
-    io: Io,
-    target_base: []const u8,
-    static_prefix: []const u8,
-    target_path: ?[]const u8 = null,
-    strip_prefix: bool = false,
-    forward_locals_as_query: []const ProxyFieldMapping = &.{},
-    forward_locals_as_form_body: []const ProxyFieldMapping = &.{},
-    forward_locals_as_header: []const ProxyFieldMapping = &.{},
-};
-
 pub const App = struct {
     allocator: Allocator,
     server: Server,
     middlewares: std.ArrayList(Middleware),
     routes: std.ArrayList(RouteEntry),
     streaming_routes: std.ArrayList(StreamingRouteEntry),
-    proxy_configs: std.ArrayList(*ProxyConfig),
     response_hook: ?*const fn (*const Request, *Response) void,
     json_errors: bool = false,
+    providers: ?*Providers = null,
 
-    pub fn init(allocator: Allocator, config: Server.Config) !App {
+    pub fn init(allocator: Allocator, config: Server.Config, yaml_text: []const u8) !App {
         return .{
             .allocator = allocator,
             .server = try Server.init(allocator, config),
             .middlewares = .empty,
             .routes = .empty,
             .streaming_routes = .empty,
-            .proxy_configs = .empty,
             .response_hook = null,
+            .providers = try Providers.init(allocator, yaml_text),
         };
     }
 
     pub fn deinit(self: *App) void {
         self.routes.deinit(self.allocator);
         self.streaming_routes.deinit(self.allocator);
-        for (self.proxy_configs.items) |cfg| {
-            self.allocator.free(cfg.static_prefix);
-            self.allocator.destroy(cfg);
+        if (self.providers) |providers| {
+            providers.deinit(self.allocator);
         }
-        self.proxy_configs.deinit(self.allocator);
         self.middlewares.deinit(self.allocator);
         self.server.deinit();
     }
@@ -112,13 +82,7 @@ pub const App = struct {
         try self.middlewares.append(self.allocator, mw);
     }
 
-    pub fn route(
-        self: *App,
-        method: Method,
-        path: []const u8,
-        handler: HandlerFn,
-        ctx: ?*anyopaque
-    ) !void {
+    pub fn route(self: *App, method: Method, path: []const u8, handler: HandlerFn, ctx: ?*anyopaque) !void {
         try self.routes.append(self.allocator, .{
             .method = method,
             .path = path,
@@ -147,55 +111,13 @@ pub const App = struct {
         return self.route(.patch, path, handler, ctx);
     }
 
-    pub fn routeStreaming(
-        self: *App,
-        method: Method,
-        path: []const u8,
-        handler: StreamingHandlerFn,
-        ctx: ?*anyopaque
-    ) !void {
+    pub fn routeStreaming(self: *App, method: Method, path: []const u8, handler: StreamingHandlerFn, ctx: ?*anyopaque) !void {
         try self.streaming_routes.append(self.allocator, .{
             .method = method,
             .path = path,
             .handler = handler,
             .ctx = ctx,
         });
-    }
-
-    pub fn proxy(
-        self: *App,
-        io: Io,
-        method: Method,
-        pattern: []const u8,
-        target_base: []const u8
-    ) !void {
-        return self.proxyOpts(io, method, pattern, target_base, .{ .strip_prefix = true });
-    }
-
-    pub fn proxyOpts(
-        self: *App,
-        io: Io,
-        method: Method,
-        pattern: []const u8,
-        target_base: []const u8,
-        opts: ProxyOptions
-    ) !void {
-        const prefix = try self.allocator.dupe(u8, staticPrefix(pattern));
-
-        const cfg = try self.allocator.create(ProxyConfig);
-        cfg.* = .{
-            .io = io,
-            .target_base = target_base,
-            .static_prefix = prefix,
-            .target_path = opts.target_path,
-            .strip_prefix = opts.strip_prefix,
-            .forward_locals_as_query = opts.forward_locals_as_query,
-            .forward_locals_as_form_body = opts.forward_locals_as_form_body,
-            .forward_locals_as_header = opts.forward_locals_as_header,
-        };
-        try self.proxy_configs.append(self.allocator, cfg);
-
-        try self.route(method, pattern, proxyHandle, @ptrCast(cfg));
     }
 
     pub fn onResponse(self: *App, hook: *const fn (*const Request, *Response) void) void {
@@ -301,129 +223,6 @@ fn staticPrefix(pattern: []const u8) []const u8 {
         i += 1;
     }
     return pattern;
-}
-
-fn proxyHandle(
-    ctx: ?*anyopaque,
-    allocator: Allocator,
-    req: *const Request,
-    res: *Response
-) !void {
-    const cfg: *ProxyConfig = @ptrCast(@alignCast(ctx orelse return error.NoContext));
-
-    const upstream_path: []const u8 = if (cfg.target_path) |tp|
-        tp
-    else if (cfg.strip_prefix and std.mem.startsWith(u8, req.path, cfg.static_prefix))
-        req.path[cfg.static_prefix.len..]
-    else
-        req.path;
-
-    const url = try buildUpstreamUrl(allocator, cfg, req, upstream_path);
-    defer allocator.free(url);
-
-    var hdr_buf: std.ArrayList([2][]const u8) = .empty;
-    defer hdr_buf.deinit(allocator);
-    if (req.getHeader("Content-Type")) |v| try hdr_buf.append(allocator, .{ "Content-Type", v });
-    if (req.getHeader("Accept")) |v| try hdr_buf.append(allocator, .{ "Accept", v });
-    for (cfg.forward_locals_as_header) |m| {
-        if (req.getLocal(m.local_key)) |v| {
-            try hdr_buf.append(allocator, .{ m.upstream_name, v });
-        }
-    }
-
-    var body_owned: ?[]u8 = null;
-    defer if (body_owned) |b| allocator.free(b);
-    const body: ?[]const u8 = blk: {
-        if (cfg.forward_locals_as_form_body.len == 0) {
-            break :blk if (req.body.len > 0) req.body else null;
-        }
-        const method = req.method;
-        const mutates = method == .post or method == .put or method == .patch;
-        if (!mutates) {
-            break :blk if (req.body.len > 0) req.body else null;
-        }
-        const ct = req.getHeader("Content-Type") orelse "";
-        if (!std.mem.startsWith(u8, ct, "application/x-www-form-urlencoded")) {
-            break :blk if (req.body.len > 0) req.body else null;
-        }
-        body_owned = try appendLocalsToFormBody(allocator, req.body, req, cfg.forward_locals_as_form_body);
-        break :blk body_owned;
-    };
-
-    const method_str = req.method.toString();
-    const handler_io = req.io orelse cfg.io;
-    var upstream = Client.request(allocator, handler_io, .{
-        .method = method_str,
-        .url = url,
-        .headers = hdr_buf.items,
-        .body = body,
-    }) catch |err| {
-        std.log.err("proxy {s} {s}: upstream connect failed: {}", .{ method_str, url, err });
-        res.status = .bad_gateway;
-        try res.write("Bad Gateway");
-        return;
-    };
-    defer upstream.deinit();
-
-    res.status = @enumFromInt(upstream.status);
-    if (upstream.header("Content-Type")) |ct| try res.setHeader("Content-Type", ct);
-    for (upstream.headers) |h| {
-        if (std.mem.startsWith(u8, h.name, "X-") or std.ascii.startsWithIgnoreCase(h.name, "HX-")) {
-            try res.setHeader(h.name, h.value);
-        }
-    }
-    try res.write(upstream.body);
-}
-
-fn buildUpstreamUrl(
-    allocator: Allocator,
-    cfg: *const ProxyConfig,
-    req: *const Request,
-    upstream_path: []const u8
-) ![]const u8 {
-    var url: std.ArrayList(u8) = .empty;
-    errdefer url.deinit(allocator);
-    try url.appendSlice(allocator, cfg.target_base);
-    try url.appendSlice(allocator, upstream_path);
-
-    var has_query = false;
-    if (req.query_string) |qs| {
-        if (qs.len > 0) {
-            try url.append(allocator, '?');
-            try url.appendSlice(allocator, qs);
-            has_query = true;
-        }
-    }
-    for (cfg.forward_locals_as_query) |m| {
-        const value = req.getLocal(m.local_key) orelse continue;
-        try url.append(allocator, if (has_query) '&' else '?');
-        try url.appendSlice(allocator, m.upstream_name);
-        try url.append(allocator, '=');
-        try url.appendSlice(allocator, value);
-        has_query = true;
-    }
-    return try url.toOwnedSlice(allocator);
-}
-
-fn appendLocalsToFormBody(
-    allocator: Allocator,
-    existing: []const u8,
-    req: *const Request,
-    mappings: []const ProxyFieldMapping
-) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, existing);
-    var has_field = existing.len > 0;
-    for (mappings) |m| {
-        const value = req.getLocal(m.local_key) orelse continue;
-        if (has_field) try out.append(allocator, '&');
-        try out.appendSlice(allocator, m.upstream_name);
-        try out.append(allocator, '=');
-        try out.appendSlice(allocator, value);
-        has_field = true;
-    }
-    return try out.toOwnedSlice(allocator);
 }
 
 fn pathMatches(pattern: []const u8, path: []const u8) bool {

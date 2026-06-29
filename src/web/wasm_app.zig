@@ -5,7 +5,7 @@ const http = @import("schnell");
 const Buffer = @import("buffer.zig").Buffer;
 const wasm_log = @import("log.zig");
 pub const TokenStore = @import("token_store.zig").TokenStore;
-
+pub const Providers = http.providers.Providers;
 pub const Request = http.Request;
 pub const Response = http.Response;
 pub const Method = http.Method;
@@ -47,8 +47,9 @@ pub const WasmApp = struct {
     expr_fba: std.heap.FixedBufferAllocator,
     response_hook: ?*const fn (*const Request, *Response, []u8) void,
     token_store: ?*TokenStore = null,
+    providers: ?*Providers = null,
 
-    pub fn init(allocator: Allocator, config: Config) !WasmApp {
+    pub fn init(allocator: Allocator, config: Config, yaml_text: []const u8) !WasmApp {
         const res_buf = try allocator.create(Buffer);
         res_buf.* = try Buffer.init(allocator, config.render_buffer_size);
 
@@ -65,10 +66,14 @@ pub const WasmApp = struct {
             .expr_buf = expr_buf,
             .expr_fba = std.heap.FixedBufferAllocator.init(expr_buf),
             .response_hook = null,
+            .providers = try Providers.init(allocator, yaml_text),
         };
     }
 
     pub fn deinit(self: *WasmApp) void {
+        if (self.providers) |providers| {
+            providers.deinit(self.allocator);
+        }
         self.res_buf.deinit();
         self.allocator.destroy(self.res_buf);
         self.allocator.free(self.resp_buf);
@@ -283,4 +288,19 @@ fn errorBody(err: anyerror) []const u8 {
         error.EmptyBody => "Empty Body",
         else => "Internal Server Error",
     };
+}
+test "WasmApp init with providers" {
+    const allocator = std.testing.allocator;
+    const yaml_text =
+        \\google_oauth:
+        \\  client_id: "test-id"
+        \\  client_secret: "test-secret"
+        \\  redirect_uri: "http://localhost"
+        \\  scopes: "profile"
+    ;
+    var app = try WasmApp.init(allocator, .{}, yaml_text);
+    defer app.deinit();
+
+    try std.testing.expect(app.providers.google_oauth != null);
+    try std.testing.expect(std.mem.eql(u8, app.providers.google_oauth.?.client_id, "test-id"));
 }

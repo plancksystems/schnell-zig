@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -16,7 +15,7 @@ const CreatePaymentOptions = provider.CreatePaymentOptions;
 pub const StripeConfig = struct {
     secret_key: []const u8,
     publishable_key: []const u8 = "",
-    webhook_secret: ?[]const u8 = null,
+    webhook_secret: []const u8 = "",
 };
 
 pub const StripeProvider = struct {
@@ -109,7 +108,6 @@ pub const StripeProvider = struct {
         return parseWebhookEvent(allocator, payload);
     }
 
-    
     fn parsePaymentIntent(allocator: Allocator, body: []const u8) !PaymentIntent {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();

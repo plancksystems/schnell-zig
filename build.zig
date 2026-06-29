@@ -33,6 +33,13 @@ pub fn build(b: *std.Build) void {
     });
     proto_mod.addImport("utils", utils_mod);
 
+    const yaml_dep = b.dependency("yaml", .{});
+    const yaml_mod = b.createModule(.{
+        .root_source_file = yaml_dep.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const plank_dep = b.dependency("planck_zig_client", .{});
     const planck_zig_client_mod = b.createModule(.{
         .root_source_file = plank_dep.path("src/root.zig"),
@@ -53,6 +60,7 @@ pub fn build(b: *std.Build) void {
     schnell_mod.addImport("proto", proto_mod);
     schnell_mod.addImport("bson", bson_mod);
     schnell_mod.addImport("planck_zig_client", planck_zig_client_mod);
+    schnell_mod.addImport("yaml", yaml_mod);
 
     const web_mod = b.addModule("web", .{
         .root_source_file = b.path("src/web/root.zig"),
@@ -71,6 +79,7 @@ pub fn build(b: *std.Build) void {
     providers_mod.addImport("tls", tls_mod);
     providers_mod.addImport("proto", proto_mod);
     providers_mod.addImport("planck_zig_client", planck_zig_client_mod);
+    providers_mod.addImport("yaml", yaml_mod);
 
     const schnell_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -82,6 +91,7 @@ pub fn build(b: *std.Build) void {
     schnell_tests_mod.addImport("proto", proto_mod);
     schnell_tests_mod.addImport("bson", bson_mod);
     schnell_tests_mod.addImport("planck_zig_client", planck_zig_client_mod);
+    schnell_tests_mod.addImport("yaml", yaml_mod);
     const schnell_tests = b.addTest(.{ .root_module = schnell_tests_mod });
 
     const request_parser_tests_mod = b.createModule(.{
