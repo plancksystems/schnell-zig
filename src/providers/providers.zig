@@ -15,7 +15,6 @@ pub const Providers = struct {
     fcm: ?notify.FcmConfig = null,
     smtp: ?notify.SmtpConfig = null,
     twilio: ?notify.TwilioConfig = null,
-    apns: ?notify.ApnsConfig = null,
 
     pub fn init(allocator: std.mem.Allocator, yaml_text: []const u8) !*Providers {
         var y = Yaml{ .source = yaml_text };
@@ -44,15 +43,10 @@ pub const Providers = struct {
         }
         if (self.firebase) |firebase| {
             allocator.free(firebase.api_key);
-            allocator.free(firebase.auth_domain);
             allocator.free(firebase.project_id);
-            allocator.free(firebase.storage_bucket);
         }
         if (self.cookie) |cookie| {
             allocator.free(cookie.cookie_name);
-            allocator.free(cookie.cookie_secret);
-            allocator.free(cookie.cookie_domain);
-            allocator.free(cookie.cookie_path);
             allocator.free(cookie.session_lookup_url);
             allocator.free(cookie.field_mappings);
             allocator.free(cookie.skip_paths);
@@ -65,7 +59,9 @@ pub const Providers = struct {
         if (self.razorpay) |razorpay| {
             allocator.free(razorpay.key_id);
             allocator.free(razorpay.key_secret);
-            allocator.free(razorpay.webhook_secret);
+            if (razorpay.webhook_secret) |wh| {
+                allocator.free(wh);
+            }
         }
         if (self.sendgrid) |sendgrid| {
             allocator.free(sendgrid.api_key);
@@ -85,12 +81,6 @@ pub const Providers = struct {
             allocator.free(twilio.account_sid);
             allocator.free(twilio.auth_token);
             allocator.free(twilio.from_number);
-        }
-        if (self.apns) |apns| {
-            allocator.free(apns.bundle_id);
-            allocator.free(apns.team_id);
-            allocator.free(apns.key_id);
-            allocator.free(apns.private_key);
         }
     }
 };
