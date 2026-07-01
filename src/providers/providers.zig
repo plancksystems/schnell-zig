@@ -17,6 +17,12 @@ pub const Providers = struct {
     twilio: ?notify.TwilioConfig = null,
 
     pub fn init(allocator: std.mem.Allocator, yaml_text: []const u8) !*Providers {
+        if (yaml_text.len == 0) {
+            const self = try allocator.create(Providers);
+            self.* = .{};
+            return self;
+        }
+
         var y = Yaml{ .source = yaml_text };
         try y.load(allocator);
         defer y.deinit(allocator);
